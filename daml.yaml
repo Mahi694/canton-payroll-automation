@@ -1,0 +1,10 @@
+sdk-version: 3.4.0
+name: canton-payroll-automation
+version: 0.1.0
+source: daml
+dependencies:
+  - daml-prim
+  - daml-stdlib
+  - daml-script
+build-options:
+  - --target=2.1
