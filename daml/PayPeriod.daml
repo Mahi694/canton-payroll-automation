@@ -1,0 +1,182 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module PayPeriod where
+
+import Daml.Script
+import DA.Date as Date
+import DA.Set (Set)
+import qualified DA.Set as Set
+import DA.Time (time)
+import Employee (Compensation)
+
+-- | Represents the frequency of the pay period.
+data PayPeriodType = Monthly | BiWeekly | Weekly
+  deriving (Eq, Show, Ord)
+
+-- | Represents the status of the payroll processing for a given period.
+data PayPeriodStatus = Pending | Processing | Completed | Failed
+  deriving (Eq, Show, Ord)
+
+-- | Defines a specific payroll period for a company. This contract acts as the
+-- | state machine for a single payroll run, tracking its status from initiation
+-- | to completion. The existence of this contract authorizes the `payrollProvider`
+-- | to process salaries for the given timeframe.
+template PayPeriod
+  with
+    company         : Party         -- ^ The legal entity paying the salaries.
+    hrManager       : Party         -- ^ The HR manager authorizing the payroll run.
+    payrollProvider : Party         -- ^ The service or entity executing the payroll.
+    payPeriodId     : Text          -- ^ A unique identifier for the period, e.g., "2024-07".
+    periodType      : PayPeriodType -- ^ The frequency of the payroll cycle.
+    startDate       : Date          -- ^ The first day of the pay period.
+    endDate         : Date          -- ^ The last day of the pay period.
+    paymentDate     : Date          -- ^ The date on which salaries are to be disbursed.
+    status          : PayPeriodStatus -- ^ The current status of the payroll run.
+    processedEmployees : Set Party  -- ^ A set of employees already paid in this period.
+  where
+    signatory company
+    observer hrManager, payrollProvider
+
+    key (company, payPeriodId) : (Party, Text)
+    maintainer key._1
+
+    -- | Ensures that the date sequence is logical: start <= end < payment.
+    ensure startDate <= endDate && endDate < paymentDate
+
+    -- | HR manager can initiate the payroll run, moving the status from Pending to Processing.
+    -- | This is the signal for the payrollProvider to start calculating and disbursing salaries.
+    choice StartProcessing : ContractId PayPeriod
+      controller hrManager
+      do
+        assertMsg "Pay period must be in Pending state to start processing."
+          (status == Pending)
+
+        -- Check that the current ledger time is on or after the period's end date
+        -- to prevent premature processing.
+        now <- time <$> getLedgerTime
+        assertMsg ("Cannot start processing before the period end date: " <> show endDate)
+          (Date.toDateUTC now >= endDate)
+
+        create this with status = Processing
+
+    -- | The payroll provider marks an employee as paid for this period.
+    -- | This is typically called within a larger, atomic workflow where the actual
+    -- | salary disbursement also happens.
+    choice MarkEmployeeAsPaid : ContractId PayPeriod
+      with
+        employee : Party
+      controller payrollProvider
+      do
+        assertMsg "Pay period must be in Processing state."
+          (status == Processing)
+        assertMsg ("Employee " <> show employee <> " has already been processed for this period.")
+          (not $ Set.member employee processedEmployees)
+
+        create this with
+          processedEmployees = Set.insert employee processedEmployees
+
+    -- | HR manager can finalize the pay period once all disbursements are confirmed.
+    -- | This moves the status to Completed.
+    choice CompletePeriod : ContractId PayPeriod
+      controller hrManager
+      do
+        assertMsg "Pay period must be in Processing state to be completed."
+          (status == Processing)
+
+        -- In a production system, this choice could include checks to ensure the
+        -- number of processedEmployees matches the expected number of active employees.
+        create this with status = Completed
+
+    -- | HR can mark a processing run as failed if an unrecoverable error occurs.
+    -- | This provides an escape hatch from the standard workflow.
+    choice MarkAsFailed : ContractId PayPeriod
+      with
+        reason : Text
+      controller hrManager
+      do
+        assertMsg "Pay period must be in Pending or Processing state to be marked as failed."
+          (status == Pending || status == Processing)
+
+        create this with status = Failed
+
+    -- | Archives the contract after the period is completed or has failed.
+    -- | This helps keep the Active Contract Set (ACS) clean of historical data.
+    choice ArchivePeriod : ()
+      controller hrManager
+      do
+        assertMsg "Pay period must be in a terminal state (Completed or Failed) to be archived."
+          (status == Completed || status == Failed)
+
+        return ()
+
+
+-- | Daml Script for setting up and testing the PayPeriod template.
+setup_PayPeriod : Script ()
+setup_PayPeriod = script do
+  -- Party Allocation
+  company <- allocatePartyWithHint "Company" (PartyIdHint "company")
+  hrManager <- allocatePartyWithHint "HRManager" (PartyIdHint "hrmanager")
+  payrollProvider <- allocatePartyWithHint "PayrollProvider" (PartyIdHint "payrollprovider")
+
+  -- Date Setup
+  let startDate = fromGregorian_2000_01_01 2024 7 1
+  let endDate = fromGregorian_2000_01_01 2024 7 31
+  let paymentDate = fromGregorian_2000_01_01 2024 8 5
+  let payPeriodId = "2024-07-monthly"
+
+  -- Test: Create a valid PayPeriod
+  debug $ "Creating valid pay period: " <> payPeriodId
+  payPeriodCid <- submit company do
+    create PayPeriod with
+      company
+      hrManager
+      payrollProvider
+      payPeriodId
+      periodType = Monthly
+      startDate
+      endDate
+      paymentDate
+      status = Pending
+      processedEmployees = Set.empty
+
+  -- Test: Invalid date sequence (end before start) should fail creation
+  debug "Testing invalid date sequence..."
+  submitMustFail company do
+    create PayPeriod with
+      company
+      hrManager
+      payrollProvider
+      payPeriodId = "2024-08-invalid-dates"
+      periodType = Monthly
+      startDate = fromGregorian_2000_01_01 2024 8 31
+      endDate = fromGregorian_2000_01_01 2024 8 1
+      paymentDate = fromGregorian_2000_01_01 2024 9 5
+      status = Pending
+      processedEmployees = Set.empty
+
+  -- Test: Lookup by key should succeed
+  debug $ "Looking up pay period by key: " <> payPeriodId
+  Some payPeriodLookupCid <- queryContractKey @PayPeriod company (company, payPeriodId)
+  assert (payPeriodLookupCid == payPeriodCid)
+
+  -- Test: Creating a duplicate pay period (same key) should fail
+  debug "Testing duplicate key creation..."
+  submitMustFail company do
+    create PayPeriod with
+      company
+      hrManager
+      payrollProvider
+      payPeriodId -- Same ID
+      periodType = Monthly
+      startDate
+      endDate
+      paymentDate
+      status = Pending
+      processedEmployees = Set.empty
+
+  -- Note: Testing the `StartProcessing` choice requires advancing ledger time past
+  -- the `endDate`. This can be done in more advanced tests using `setTime`.
+  -- e.g., setTime (time Date.fromGregorian_2000_01_01 2024 7 31 12 0 0)
+  debug "PayPeriod setup script completed successfully."
+  return ()
