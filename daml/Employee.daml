@@ -1,0 +1,76 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module Employee where
+
+import DA.Date (Date)
+
+-- | Represents an employee's master record within the payroll system.
+-- This contract holds all necessary information for calculating payroll, including
+-- salary and various deduction parameters. It is created and managed by the HR
+-- department.
+template Employee
+  with
+    hr: Party
+      -- ^ The party representing the HR department, who manages the employee record.
+    employeeParty: Party
+      -- ^ The party representing the employee.
+    employeeId: Text
+      -- ^ A unique identifier for the employee within the organization.
+    employeeName: Text
+      -- ^ The full legal name of the employee.
+    employmentStartDate: Date
+      -- ^ The official start date of employment.
+    baseSalary: Decimal
+      -- ^ The gross annual salary.
+    taxDeductionPercentage: Decimal
+      -- ^ The percentage of gross pay to be withheld for taxes (e.g., 0.25 for 25%).
+    benefitsDeductionAmount: Decimal
+      -- ^ A fixed amount deducted per pay period for benefits like health insurance.
+    retirementContributionPercentage: Decimal
+      -- ^ The percentage of gross pay the employee contributes to a retirement plan.
+  where
+    signatory hr
+    observer employeeParty
+
+    key (hr, employeeId) : (Party, Text)
+    maintainer key._1
+
+    ensure
+      baseSalary >= 0.0 &&
+      taxDeductionPercentage >= 0.0 && taxDeductionPercentage <= 1.0 &&
+      benefitsDeductionAmount >= 0.0 &&
+      retirementContributionPercentage >= 0.0 && retirementContributionPercentage <= 1.0
+
+    -- | Updates the employee's compensation details. This archives the current
+    -- | contract and creates a new one with the updated values, ensuring a clear
+    -- | audit trail of compensation changes.
+    choice UpdateCompensation : ContractId Employee
+      with
+        newBaseSalary: Decimal
+          -- ^ The new gross annual salary.
+        newTaxDeductionPercentage: Decimal
+          -- ^ The new tax withholding percentage.
+        newBenefitsDeductionAmount: Decimal
+          -- ^ The new fixed deduction amount for benefits per pay period.
+        newRetirementContributionPercentage: Decimal
+          -- ^ The new retirement contribution percentage.
+      controller hr
+      do
+        create this with
+          baseSalary = newBaseSalary
+          taxDeductionPercentage = newTaxDeductionPercentage
+          benefitsDeductionAmount = newBenefitsDeductionAmount
+          retirementContributionPercentage = newRetirementContributionPercentage
+
+    -- | Archives the employee record, typically used upon employment termination.
+    -- This action removes the active `Employee` contract from the ledger.
+    choice ArchiveEmployeeRecord : ()
+      with
+        reasonForArchival: Text
+          -- ^ A brief description of why the record is being archived (e.g., "Resignation", "Retirement").
+      controller hr
+      do
+        -- In a more complex workflow, this could create a `TerminatedEmployee` record
+        -- for archival purposes. For this simple case, we just archive the contract.
+        return ()
