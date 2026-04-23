@@ -1,0 +1,213 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module PayrollTest where
+
+import Daml.Script
+import DA.Date
+import DA.Time
+import DA.Assert
+
+import Employee
+import PayPeriod
+import DeductionRule
+import SalaryTransfer
+
+-- | A simple account template to mock fund transfers for testing purposes.
+-- In a real scenario, this would be replaced by a proper wallet or bank account contract,
+-- potentially implementing a token standard.
+template MockAccount
+  with
+    owner: Party
+    balance: Decimal
+    currency: Text
+  where
+    signatory owner
+
+    choice Deposit: ContractId MockAccount
+      with
+        amount: Decimal
+      controller owner
+      do
+        assertMsg "Deposit amount must be positive" $ amount > 0.0
+        create this with balance = balance + amount
+
+    choice Withdraw: ContractId MockAccount
+      with
+        amount: Decimal
+      controller owner
+      do
+        assertMsg "Withdrawal amount must be positive" $ amount > 0.0
+        assertMsg "Insufficient funds for withdrawal" $ balance >= amount
+        create this with balance = balance - amount
+
+-- | Main test suite for the payroll automation project.
+payrollTests = script do
+  -- === 1. SETUP ===
+  hr <- allocatePartyWithHint "HRManager" (PartyIdHint "hr-manager")
+  payrollProvider <- allocatePartyWithHint "PayrollCorp" (PartyIdHint "payroll-corp")
+  employee <- allocatePartyWithHint "Alice" (PartyIdHint "alice")
+
+  let
+    today = date 2024 Mar 15
+    currentTime = time today 0 0 0
+
+    annualSalary = 120000.0
+    payPeriodsPerYear = 12 -- Monthly
+    expectedGrossPay = annualSalary / (intToDecimal payPeriodsPerYear)
+
+    periodStartDate = date 2024 Mar 1
+    periodEndDate = date 2024 Mar 31
+    payDate = periodEndDate
+
+  -- === 2. TEST CASES ===
+
+  test "Calculate Gross Pay for a Pay Period" do
+    -- Create the necessary contracts for the calculation.
+    compCid <- submit hr do
+      createCmd Employee.Compensation with
+        employee
+        hr
+        payrollProvider
+        annualSalary
+        currency = "USD"
+
+    payPeriodCid <- submit payrollProvider do
+      createCmd PayPeriod.Details with
+        payrollProvider
+        employee
+        periodStartDate
+        periodEndDate
+        payDate
+        payPeriodsPerYear
+
+    -- Exercise the choice to calculate gross pay.
+    grossPay <- submit payrollProvider do
+      exerciseCmd payPeriodCid PayPeriod.Details_CalculateGrossPay with compCid
+
+    -- Assert the result is as expected.
+    grossPay === expectedGrossPay
+    grossPay === 10000.0
+
+  test "Calculate Net Pay with Percentage and Fixed Deductions" do
+    -- Create compensation and pay period details.
+    compCid <- submit hr do
+      createCmd Employee.Compensation with employee, hr, payrollProvider, annualSalary, currency = "USD"
+
+    payPeriodCid <- submit payrollProvider do
+      createCmd PayPeriod.Details with payrollProvider, employee, periodStartDate, periodEndDate, payDate, payPeriodsPerYear
+
+    -- Create deduction rules.
+    taxRuleCid <- submit payrollProvider do
+      createCmd DeductionRule.Rule with
+        provider = payrollProvider
+        observers = [employee, hr]
+        description = "Federal Income Tax Withholding"
+        ruleType = DeductionRule.Percentage 0.15
+
+    healthRuleCid <- submit payrollProvider do
+      createCmd DeductionRule.Rule with
+        provider = payrollProvider
+        observers = [employee, hr]
+        description = "Health Insurance Premium"
+        ruleType = DeductionRule.FixedAmount 250.0
+
+    let deductionRuleCids = [taxRuleCid, healthRuleCid]
+
+    -- Exercise the net pay calculation choice.
+    (netPay, grossPay, _deductions) <- submit payrollProvider do
+      exerciseCmd payPeriodCid PayPeriod.Details_CalculateNetPay with compCid, deductionRuleCids
+
+    -- Assert the calculation is correct.
+    -- Gross: 10000.0
+    -- Tax Deduction: 10000.0 * 0.15 = 1500.0
+    -- Health Deduction: 250.0
+    -- Total Deductions: 1750.0
+    -- Net Pay: 10000.0 - 1750.0 = 8250.0
+    grossPay === 10000.0
+    netPay === 8250.0
+
+  test "End-to-end payroll run with salary transfer" do
+    -- Create mock accounts for the company and the employee.
+    let initialCompanyBalance = 100000.0
+    let initialEmployeeBalance = 500.0
+    companyAccountCid <- submit payrollProvider do createCmd MockAccount with owner = payrollProvider, balance = initialCompanyBalance, currency = "USD"
+    employeeAccountCid <- submit employee do createCmd MockAccount with owner = employee, balance = initialEmployeeBalance, currency = "USD"
+
+    -- Setup payroll contracts.
+    compCid <- submit hr do
+      createCmd Employee.Compensation with employee, hr, payrollProvider, annualSalary, currency = "USD"
+    payPeriodCid <- submit payrollProvider do
+      createCmd PayPeriod.Details with payrollProvider, employee, periodStartDate, periodEndDate, payDate, payPeriodsPerYear
+    taxRuleCid <- submit payrollProvider do
+      createCmd DeductionRule.Rule with provider = payrollProvider, observers = [employee, hr], description = "Federal Income Tax Withholding", ruleType = DeductionRule.Percentage 0.20
+    healthRuleCid <- submit payrollProvider do
+      createCmd DeductionRule.Rule with provider = payrollProvider, observers = [employee, hr], description = "Health Insurance Premium", ruleType = DeductionRule.FixedAmount 300.0
+    let deductionRuleCids = [taxRuleCid, healthRuleCid]
+
+    -- Payroll provider initiates the salary transfer process.
+    -- This calculates net pay and creates a proposal for the employee.
+    transferProposalCid <- submit payrollProvider do
+      exerciseCmd payPeriodCid PayPeriod.Details_InitiateSalaryTransfer with compCid, deductionRuleCids
+
+    -- The employee reviews and accepts the salary transfer proposal.
+    -- This acceptance triggers the atomic movement of funds.
+    -- We assume the `Proposal_Accept` choice finds the correct accounts on ledger
+    -- based on the owners. In this test, we provide them for simplicity.
+    _ <- submit employee do
+      exerciseCmd transferProposalCid SalaryTransfer.Proposal_Accept with
+        fromAccountCid = companyAccountCid
+        toAccountCid = employeeAccountCid
+
+    -- Fetch the final state of the accounts.
+    companyAccount <- queryContractId payrollProvider companyAccountCid
+    employeeAccount <- queryContractId employee employeeAccountCid
+
+    -- Assert that balances have been updated correctly.
+    -- Gross: 10000.0
+    -- Tax Deduction: 10000.0 * 0.20 = 2000.0
+    -- Health Deduction: 300.0
+    -- Total Deductions: 2300.0
+    -- Net Pay: 10000.0 - 2300.0 = 7700.0
+    let expectedNetPay = 7700.0
+    let expectedFinalCompanyBalance = initialCompanyBalance - expectedNetPay
+    let expectedFinalEmployeeBalance = initialEmployeeBalance + expectedNetPay
+
+    companyAccount.balance === expectedFinalCompanyBalance
+    employeeAccount.balance === expectedFinalEmployeeBalance
+
+  test "Fail to accept transfer with wrong accounts" do
+    -- Setup accounts, including a decoy account.
+    companyAccountCid <- submit payrollProvider do createCmd MockAccount with owner = payrollProvider, balance = 100000.0, currency = "USD"
+    employeeAccountCid <- submit employee do createCmd MockAccount with owner = employee, balance = 500.0, currency = "USD"
+    decoyAccountCid <- submit payrollProvider do createCmd MockAccount with owner = payrollProvider, balance = 1.0, currency = "USD"
+
+    -- Setup payroll contracts.
+    compCid <- submit hr do
+      createCmd Employee.Compensation with employee, hr, payrollProvider, annualSalary, currency = "USD"
+    payPeriodCid <- submit payrollProvider do
+      createCmd PayPeriod.Details with payrollProvider, employee, periodStartDate, periodEndDate, payDate, payPeriodsPerYear
+    let deductionRuleCids = [] -- No deductions for simplicity
+
+    -- Initiate transfer proposal.
+    transferProposalCid <- submit payrollProvider do
+      exerciseCmd payPeriodCid PayPeriod.Details_InitiateSalaryTransfer with compCid, deductionRuleCids
+
+    -- Attempt to accept the transfer using the wrong "from" account.
+    -- This should fail because the signatory on the transfer proposal (payrollProvider)
+    -- is not the owner of the provided employee account.
+    -- The internal logic of Proposal_Accept should prevent this.
+    submitMustFail employee do
+      exerciseCmd transferProposalCid SalaryTransfer.Proposal_Accept with
+        fromAccountCid = decoyAccountCid
+        toAccountCid = employeeAccountCid
+
+    -- Attempt to accept the transfer sending funds to the wrong "to" account.
+    -- The internal logic of Proposal_Accept should validate that the toAccount
+    -- is owned by the employee specified in the proposal.
+    submitMustFail employee do
+      exerciseCmd transferProposalCid SalaryTransfer.Proposal_Accept with
+        fromAccountCid = companyAccountCid
+        toAccountCid = decoyAccountCid -- Not owned by the employee
+
+    return ()
