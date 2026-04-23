@@ -1,0 +1,95 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module DeductionRule where
+
+import DA.Date (Date)
+import DA.Optional (Optional)
+import DA.Text (Text)
+
+-- | Defines the type of payroll deduction.
+-- This allows for clear categorization and specific handling of different deductions.
+data DeductionType
+  = FederalIncomeTax
+  | StateIncomeTax Text -- ^ Holds the state code, e.g., "CA", "NY"
+  | SocialSecurity
+  | Medicare
+  | ProvidentFund Text    -- ^ Provident Fund Account Number or Scheme ID
+  | HealthInsurance Text  -- ^ Health Insurance Policy ID
+  | LifeInsurance Text    -- ^ Life Insurance Policy ID
+  | Other Text          -- ^ For miscellaneous or custom deductions
+  deriving (Eq, Show, Ord)
+
+-- | Specifies how a deduction's amount is calculated.
+data CalculationMethod
+  = FixedAmount Decimal       -- ^ A constant amount per pay period.
+  | PercentageOfGross Decimal -- ^ A percentage of the gross salary, e.g., 0.22 for 22%.
+  deriving (Eq, Show, Ord)
+
+-- | Represents a rule for calculating a specific deduction from an employee's salary.
+-- These rules are set up by the company's finance or HR department and are used by
+-- the payroll engine to calculate net pay. The `provider` is typically a party
+-- representing the finance department, while the `beneficiary` is the party to whom
+-- the deducted amount is eventually paid (e.g., Tax Authority, Insurer).
+template DeductionRule
+  with
+    provider          : Party   -- ^ The party managing the rule (e.g., Finance Dept).
+    company           : Party   -- ^ The company for which this rule applies.
+    ruleId            : Text    -- ^ A unique identifier for the deduction rule.
+    description       : Text    -- ^ A human-readable description of the deduction.
+    deductionType     : DeductionType
+    calculationMethod : CalculationMethod
+    beneficiary       : Party
+    effectiveFrom     : Date    -- ^ The date from which this rule is active.
+    effectiveTo       : Optional Date -- ^ The optional date until which this rule is active.
+  where
+    signatory provider
+    observer company
+
+    key (company, ruleId) : (Party, Text)
+    maintainer key._1
+
+    -- | Checks if the rule is active on a given date. This is useful for payroll
+    -- processing to select the correct rules for a specific pay period.
+    nonconsuming choice IsActive : Bool
+      with
+        asOfDate: Date
+      controller company, provider
+      do
+        let isAfterFrom = asOfDate >= effectiveFrom
+        let isBeforeTo = case effectiveTo of
+                           None -> True
+                           Some endDate -> asOfDate <= endDate
+        return (isAfterFrom && isBeforeTo)
+
+    -- | Archives the deduction rule, for instance when it is replaced by a new one or
+    -- becomes obsolete. This maintains an immutable history of rules.
+    choice Archive : ()
+      controller provider
+      do
+        return ()
+
+-- | A record to hold a calculated deduction amount along with its rule context.
+-- This is useful when processing payroll to have all necessary information together.
+data CalculatedDeduction = CalculatedDeduction
+  with
+    ruleCid     : ContractId DeductionRule -- ^ The contract ID of the rule used for calculation.
+    rule        : DeductionRule            -- ^ The rule data itself.
+    amount      : Decimal                  -- ^ The calculated deduction amount for a given gross pay.
+  deriving (Eq, Show)
+
+-- | Applies a deduction rule to a given gross pay amount to calculate the deduction amount.
+-- This is a pure function that can be used off-ledger or within other choices.
+--
+-- Example:
+-- let ruleData = DeductionRule with calculationMethod = PercentageOfGross 0.15; ..
+-- let deductionAmount = applyDeductionRule ruleData 5000.0 -- result is 750.0
+applyDeductionRule : DeductionRule -> Decimal -> Decimal
+applyDeductionRule rule grossPay =
+  case rule.calculationMethod of
+    FixedAmount amount ->
+      assert (amount >= 0.0) $
+        amount
+    PercentageOfGross rate ->
+      assert (rate >= 0.0 && rate <= 1.0) $
+        grossPay * rate
