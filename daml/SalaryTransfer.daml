@@ -1,0 +1,106 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module Payroll.SalaryTransfer where
+
+import Daml.Finance.Interface.Holding.Fungible qualified as Fungible (I, View(..))
+import Daml.Finance.Interface.Holding.Transferable qualified as Transferable (I)
+import Daml.Finance.Interface.Types.Common.Types (Account)
+import Payroll.Employee qualified as Employee (Role)
+import Payroll.PayPeriod qualified as PayPeriod (Details)
+import DA.Time (Time, getTime)
+
+-- | Represents a proposal from a company to transfer a net salary payment to an employee.
+-- This contract facilitates the atomic delivery-vs-payment of salary using the Daml Finance library.
+-- The employee must `Accept` this proposal to trigger the actual transfer of the fungible holding.
+template SalaryTransferProposal
+  with
+    company: Party
+      -- ^ The employer making the salary payment.
+    employee: Party
+      -- ^ The employee receiving the salary.
+    employeeCid: ContractId Employee.Role
+      -- ^ A reference to the employee's role contract.
+    payPeriod: PayPeriod.Details
+      -- ^ The specific pay period this salary payment is for.
+    netSalary: Decimal
+      -- ^ The net salary amount to be transferred after all deductions.
+    salaryHoldingCid: ContractId Fungible.I
+      -- ^ The fungible holding contract (e.g., company's cash account) from which the salary will be paid.
+    employeeWallet: Account
+      -- ^ The employee's designated wallet account where the salary will be deposited.
+    id: Text
+      -- ^ A unique identifier for this transfer proposal, typically linked to a pay run.
+  where
+    signatory company
+    observer employee
+
+    ensure netSalary > 0.0
+      -- ^ The net salary must be a positive amount.
+
+    key (company, employee, id) : (Party, Party, Text)
+    maintainer key._1
+
+    -- | The employee accepts the salary payment, triggering the atomic transfer of funds.
+    -- This choice exercises the `SplitAndTransfer` choice on the company's holding, which
+    -- carves out the `netSalary` amount and transfers it to the employee's wallet.
+    choice Accept
+      : ContractId CompletedSalaryTransfer
+      -- ^ Returns the `ContractId` of the `CompletedSalaryTransfer` contract, which serves
+      -- as an auditable record of the payment.
+      controller employee
+      do
+        -- Coerce the generic Fungible Holding Interface CID to the Transferable Holding Interface CID.
+        -- This is safe because standard fungible tokens in Daml Finance implement the Transferable interface.
+        let transferableCid = coerceContractId @Transferable.I salaryHoldingCid
+
+        -- Atomically split the net salary amount from the company's main holding and transfer
+        -- the newly created holding to the employee's wallet.
+        (splitHoldingCid, _remainingHolding) <- exercise transferableCid Transferable.SplitAndTransfer with
+          newOwnerAccount = employeeWallet
+          splitAmount = netSalary
+
+        -- Record the successful transfer for audit purposes.
+        now <- getTime
+        create CompletedSalaryTransfer with
+          company
+          employee
+          employeeCid
+          payPeriod
+          netSalary
+          transferredHoldingCid = splitHoldingCid
+          transferTimestamp = now
+          id
+
+    -- | Allows either the company or the employee to reject/cancel the proposed transfer before it is accepted.
+    choice Reject : ()
+      controller company, employee
+      do
+        pure ()
+
+-- | An immutable, on-ledger record representing a successfully completed salary payment.
+-- This contract is created upon the successful exercise of the `Accept` choice on a
+-- `SalaryTransferProposal`, providing an auditable fact that the payment occurred.
+template CompletedSalaryTransfer
+  with
+    company: Party
+      -- ^ The employer who made the payment.
+    employee: Party
+      -- ^ The employee who received the payment.
+    employeeCid: ContractId Employee.Role
+      -- ^ A reference to the employee's role contract at the time of payment.
+    payPeriod: PayPeriod.Details
+      -- ^ The pay period for which the salary was paid.
+    netSalary: Decimal
+      -- ^ The net amount that was transferred.
+    transferredHoldingCid: ContractId Fungible.I
+      -- ^ The `ContractId` of the new fungible holding created in the employee's wallet.
+    transferTimestamp: Time
+      -- ^ The ledger time at which the transfer was executed.
+    id: Text
+      -- ^ The unique identifier corresponding to the original `SalaryTransferProposal`.
+  where
+    signatory company, employee
+
+    key (company, employee, id) : (Party, Party, Text)
+    maintainer key._1
